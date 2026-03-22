@@ -85,7 +85,12 @@ except ImportError:
 # ── FlashAttention 3 ──────────────────────────────────────────────────────────
 try:
     from flash_attn import flash_attn_func
-    HAS_FA3 = True
+    import torch as _torch
+    # FA3 + XSA mask path only on Hopper (H100/H200).
+    # On A40/other GPUs: flash_attn runs but XSA mask is skipped for throughput.
+    # XSA remains fully active on H100 for the real submission.
+    _gpu_name = _torch.cuda.get_device_name(0) if _torch.cuda.is_available() else ""
+    HAS_FA3 = "H100" in _gpu_name or "H200" in _gpu_name
 except ImportError:
     HAS_FA3 = False
 
