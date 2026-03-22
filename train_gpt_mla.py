@@ -1,7 +1,7 @@
 """
 train_gpt_shift.py  —  Shift-Mixed Progressive-RoPE Transformer
 ================================================================
-Novel contributions vs #315 (current best non-TTT at 1.1250):
+Novel contributions vs #315 (current best non-TTT at 1.1250)
 
   1. Shift-Mixed Embedding (replaces BigramHash)
      x = E[tok] + α * causal_roll(x, 1)
