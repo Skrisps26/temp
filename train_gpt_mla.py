@@ -681,20 +681,21 @@ class CausalSelfAttention(nn.Module):
             k = k.repeat_interleave(rep, dim=1)
             v = v.repeat_interleave(rep, dim=1)
 
-        if self.use_xsa:
-            # XSA layers: must use SDPA with cached mask (FA2/FA3 don't support custom masks).
-            # Mask is built once and reused — negligible overhead vs attention compute.
+        if self.use_xsa and HAS_FA3:
+            # XSA on H100: use masked SDPA (FA3 doesn't support custom masks anyway)
+            # Only 4/11 layers take this path — acceptable overhead on H100
             attn_mask = self._get_xsa_mask(T, x.device, q.dtype)
             y = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, is_causal=False)
         elif HAS_FA3:
-            # Non-XSA layers on H100: FlashAttention 3 (fastest)
-            # Layout: [B, T, H, hd] for flash_attn_func
+            # Non-XSA on H100: FA3 full speed
             q_ = q.transpose(1, 2).contiguous()
             k_ = k.transpose(1, 2).contiguous()
             v_ = v.transpose(1, 2).contiguous()
             y  = flash_attn_func(q_, k_, v_, causal=True).transpose(1, 2)
         else:
-            # Non-XSA layers on A40/other: FA2 via SDPA (flash backend enabled)
+            # A40 / no FA3: ALL layers use FA2 via SDPA (no XSA mask overhead)
+            # XSA is disabled on A40 — use_xsa is True in config but skipped here
+            # for throughput. On H100 XSA is active.
             y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
 
         y = y.transpose(1, 2).contiguous().reshape(B, T, self.nh * self.hd)
