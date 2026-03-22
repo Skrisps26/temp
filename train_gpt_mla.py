@@ -1010,7 +1010,7 @@ def main():
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     if 8 % world_size != 0:
         raise ValueError(f"WORLD_SIZE={world_size} must divide 8")
-    gas = 8 // world_size
+    gas = int(os.environ.get("GRAD_ACCUM", str(8 // world_size)))
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA required")
     device = torch.device("cuda", local_rank)
