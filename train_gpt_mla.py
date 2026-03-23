@@ -114,15 +114,16 @@ class Hyperparameters:
     warmdown_iters         = int(os.environ.get("WARMDOWN_ITERS",       3000))
     warmup_steps           = int(os.environ.get("WARMUP_STEPS",         20))
     # ↓ Default = A40 48GB safe. Set to 786432 for H100 80GB.
-    train_batch_tokens     = int(os.environ.get("TRAIN_BATCH_TOKENS",   524_288))
+    # A40: 131072 | 1xH100: 1048576 | 8xH100: 1048576
+    train_batch_tokens     = int(os.environ.get("TRAIN_BATCH_TOKENS",   131_072))
     train_seq_len          = int(os.environ.get("TRAIN_SEQ_LEN",        1024))
     max_wallclock_seconds  = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
 
     vocab_size    = int(os.environ.get("VOCAB_SIZE",    1024))
-    num_layers    = int(os.environ.get("NUM_LAYERS",    11))
-    num_heads     = int(os.environ.get("NUM_HEADS",     8))
+    num_layers    = int(os.environ.get("NUM_LAYERS",    12))
+    num_heads     = int(os.environ.get("NUM_HEADS",     10))
     num_kv_heads  = int(os.environ.get("NUM_KV_HEADS",  2))
-    model_dim     = int(os.environ.get("MODEL_DIM",     512))
+    model_dim     = int(os.environ.get("MODEL_DIM",     640))
     mlp_mult      = int(os.environ.get("MLP_MULT",      3))
     tie_embeddings= bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base     = float(os.environ.get("ROPE_BASE",   10000.0))
@@ -139,6 +140,8 @@ class Hyperparameters:
 
     # Shift-mixed embedding learnable scale init
     shift_alpha_init = float(os.environ.get("SHIFT_ALPHA_INIT", 0.5))
+    # Temperature for relu^2: T>1 = sparser activations = less superposition interference
+    mlp_temperature  = float(os.environ.get("MLP_TEMPERATURE", 1.5))
 
     # Optimizer
     tied_embed_lr         = float(os.environ.get("TIED_EMBED_LR",           0.03))
@@ -146,7 +149,7 @@ class Hyperparameters:
     matrix_lr             = float(os.environ.get("MATRIX_LR",               0.02))
     scalar_lr             = float(os.environ.get("SCALAR_LR",               0.02))
     mousse_momentum       = float(os.environ.get("MOUSSE_MOMENTUM",          0.99))
-    mousse_beta2          = float(os.environ.get("MOUSSE_BETA2",             0.999))
+    mousse_beta2          = float(os.environ.get("MOUSSE_BETA2",             0.95))
     mousse_backend_steps  = int(os.environ.get("MOUSSE_BACKEND_STEPS",       5))
     mousse_wd             = float(os.environ.get("MOUSSE_WD",                0.04))
     mousse_warmup_start   = float(os.environ.get("MOUSSE_WARMUP_START",      0.85))
@@ -709,32 +712,38 @@ class CausalSelfAttention(nn.Module):
 
 # ── SmearGate MLP ─────────────────────────────────────────────────────────────
 class SmearGateMLP(nn.Module):
-    """relu(gate(x))^2 * up(x) — proven better than SwiGLU at this scale."""
-    def __init__(self, dim, mlp_mult):
+    """
+    relu(gate(x)*T)^2 * up(x) where T=temperature.
+    T>1 sharpens activation -> sparser neurons -> less superposition interference.
+    T=1.5 keeps ~50% fewer active neurons vs T=1.0.
+    """
+    def __init__(self, dim, mlp_mult, temperature: float = 1.5):
         super().__init__()
-        hidden      = dim * mlp_mult
-        self.gate   = CastedLinear(dim, hidden, bias=False)
-        self.up     = CastedLinear(dim, hidden, bias=False)
-        self.proj   = CastedLinear(hidden, dim, bias=False)
+        hidden           = dim * mlp_mult
+        self.gate        = CastedLinear(dim, hidden, bias=False)
+        self.up          = CastedLinear(dim, hidden, bias=False)
+        self.proj        = CastedLinear(hidden, dim, bias=False)
         self.proj._zero_init = True
+        self.temperature = temperature
         s = dim ** -0.5
         _ortho(self.gate.weight, s)
         _ortho(self.up.weight, s)
 
     def forward(self, x: Tensor) -> Tensor:
-        return self.proj(torch.relu(self.gate(x)).square() * self.up(x))
+        return self.proj(torch.relu(self.gate(x) * self.temperature).square() * self.up(x))
 
 
 # ── Transformer Block ─────────────────────────────────────────────────────────
 class Block(nn.Module):
     def __init__(self, dim, num_heads, num_kv_heads, mlp_mult,
-                 rope_dims, use_xsa, rope_base, qk_gain_init, layer_idx):
+                 rope_dims, use_xsa, rope_base, qk_gain_init, layer_idx,
+                 mlp_temperature: float = 1.5):
         super().__init__()
         self.attn_norm  = RMSNorm()
         self.mlp_norm   = RMSNorm()
         self.attn       = CausalSelfAttention(dim, num_heads, num_kv_heads,
                                                rope_dims, use_xsa, rope_base, qk_gain_init)
-        self.mlp        = SmearGateMLP(dim, mlp_mult)
+        self.mlp        = SmearGateMLP(dim, mlp_mult, temperature=mlp_temperature)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale  = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix  = nn.Parameter(torch.stack([torch.ones(dim), torch.zeros(dim)]).float())
@@ -795,7 +804,8 @@ class GPT(nn.Module):
                 use_xsa      = (i >= xsa_start),
                 rope_base    = args.rope_base,
                 qk_gain_init = 1.5,
-                layer_idx    = i,
+                layer_idx        = i,
+                mlp_temperature  = args.mlp_temperature,
             )
             for i in range(args.num_layers)
         ])
@@ -1100,7 +1110,12 @@ def main():
 
     # ── Use EMA model for final eval and serialization ────────────────────────
     log("\n[EMA] loading EMA weights for final eval...")
-    base_model.load_state_dict(ema_model.state_dict())
+    # dtype-corrected EMA loading — prevents the 1.94 bpb corruption bug
+    ema_sd  = ema_model.state_dict()
+    base_sd = base_model.state_dict()
+    fixed_sd = {k: ema_sd[k].to(base_sd[k].dtype).contiguous() for k in base_sd}
+    base_model.load_state_dict(fixed_sd, strict=True)
+    log("[EMA] dtype-corrected weights loaded.")
 
     # Final sliding-window eval (pre-quant)
     log("[final eval] sliding-window (stride=64, context≥960 tokens)...")
