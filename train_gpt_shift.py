@@ -316,8 +316,12 @@ def execute_legal_ttt(args, base_model, rank, world_size, device, val_tokens):
     chunk_size, stride, seq_len = args.ttt_chunk_tokens, 64, args.train_seq_len
     model = GPT(args).to(device).bfloat16()
     raw_state_dict = base_model.state_dict()
-    clean_state_dict = {k.replace("_orig_mod.", ""): v for k, v in raw_state_dict.items()}
-    model.load_state_dict(base_model.state_dict())
+    clean_state_dict = {}
+    for k, v in raw_state_dict.items():
+        # Strip "_orig_mod." from ANYWHERE in the key string
+        new_k = k.replace("_orig_mod.", "")
+        clean_state_dict[new_k] = v
+    model.load_state_dict(clean_state_dict, strict=False)
     model.requires_grad_(True)
     # 1. INITIALIZE ONCE OUTSIDE THE LOOP (Memory Safe)
     ttt_ddp = DDP(model, device_ids=[device.index])
