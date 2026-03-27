@@ -51,11 +51,11 @@ class H:
     train_log_every    = int(os.environ.get("TRAIN_LOG_EVERY", 200))
 
     vocab_size    = int(os.environ.get("VOCAB_SIZE", 1024))
-    num_layers    = int(os.environ.get("NUM_LAYERS", 11))
+    num_layers    = int(os.environ.get("NUM_LAYERS", 9))
     model_dim     = int(os.environ.get("MODEL_DIM", 512))
     num_heads     = int(os.environ.get("NUM_HEADS", 8))
     num_kv_heads  = int(os.environ.get("NUM_KV_HEADS", 4))
-    mlp_mult      = int(os.environ.get("MLP_MULT", 3))
+    mlp_mult      = int(os.environ.get("MLP_MULT", 2))
     tie_embeddings = True
     rope_base     = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
@@ -75,7 +75,7 @@ class H:
     # VE128
     ve_enabled    = int(os.environ.get("VE_ENABLED", 1))
     ve_dim        = int(os.environ.get("VE_DIM", 128))
-    ve_layers_str = os.environ.get("VE_LAYERS", "9,10")
+    ve_layers_str = os.environ.get("VE_LAYERS", "7,8")
 
     # Optimizer — Adam (NO weight decay), Muon momentum 0.95 matching reference
     tied_embed_lr      = float(os.environ.get("TIED_EMBED_LR", 0.035))
@@ -94,9 +94,9 @@ class H:
 
     # TTT
     ttt_enabled      = int(os.environ.get("TTT_ENABLED", 1))
-    ttt_epochs       = int(os.environ.get("TTT_EPOCHS", 30))
-    ttt_lr           = float(os.environ.get("TTT_LR", 0.0005))
-    ttt_chunk_tokens = int(os.environ.get("TTT_CHUNK_TOKENS", 32768))
+    ttt_epochs       = int(os.environ.get("TTT_EPOCHS", 5))
+    ttt_lr           = float(os.environ.get("TTT_LR", 0.001))
+    ttt_chunk_tokens = int(os.environ.get("TTT_CHUNK_TOKENS", 262144))
     ttt_batch_seqs   = int(os.environ.get("TTT_BATCH_SEQS", 32))
     ttt_grad_clip    = float(os.environ.get("TTT_GRAD_CLIP", 1.0))
     eval_stride      = int(os.environ.get("EVAL_STRIDE", 64))
@@ -613,12 +613,12 @@ def main():
             if (p.ndim < 2 or any(pat in n for pat in CONTROL_PATTERNS)) and p.dtype != torch.float32:
                 p.data = p.data.float()
 
-    compiled = torch.compile(base_model, dynamic=False)
-    model = DDP(compiled, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled
-
-    # EMA model
+    # EMA model — MUST deepcopy BEFORE torch.compile (compile modifies the module in-place)
     ema_model = copy.deepcopy(base_model)
     ema_model.requires_grad_(False)
+
+    compiled = torch.compile(base_model, dynamic=False)
+    model = DDP(compiled, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled
 
     # SWA accumulator (tight: starts accumulating from warmdown phase)
     swa_started = False
