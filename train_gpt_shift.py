@@ -23,6 +23,7 @@ import random
 import sys
 import time
 import uuid
+import copy
 from pathlib import Path
 
 import numpy as np
