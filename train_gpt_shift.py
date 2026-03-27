@@ -475,9 +475,12 @@ def main():
     train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
 
     for step in range(args.iterations):
-        if time.perf_counter() - t0 > args.max_wallclock_seconds: 
-            log(f"Time limit reached at step {step}")
-            break
+        if step > 0 and step % 50 == 0:
+            stop_flag = torch.tensor(1 if (time.perf_counter() - t0 > args.max_wallclock_seconds) else 0, device=device)
+            dist.all_reduce(stop_flag, op=dist.ReduceOp.MAX)
+            if stop_flag.item() > 0:
+                log(f"Global time limit reached at step {step}. Initiating synchronized TTT...")
+                break
             
         # 1. Warmups & Schedules
         if step < args.warmup_steps:
@@ -547,6 +550,9 @@ def main():
         payload = pickle.dumps({"c": compress_bytes(buf.getvalue()), "m": meta})
         Path("final_model.ptz").write_bytes(payload)
         log(f"Artifact Size: {len(payload)/1e6:.2f} MB (Target < 16MB)")
+      if dist.is_available() and dist.is_initialized():
+          dist.barrier() # Forces Ranks 1-7 to wait here until Rank 0 finishes saving
+          dist.destroy_process_group()
 
 if __name__ == "__main__":
     main()
