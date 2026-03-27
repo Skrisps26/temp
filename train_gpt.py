@@ -676,7 +676,7 @@ def main():
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
     from torch.backends.cuda import enable_cudnn_sdp, enable_flash_sdp, enable_math_sdp, enable_mem_efficient_sdp
-    enable_cudnn_sdp(False); enable_flash_sdp(True); enable_mem_efficient_sdp(False); enable_math_sdp(False)
+    enable_cudnn_sdp(False); enable_flash_sdp(True); enable_mem_efficient_sdp(False); enable_math_sdp(True)
 
     logfile = None
     if master:
@@ -708,7 +708,7 @@ def main():
             if (p.ndim < 2 or any(pat in n for pat in CONTROL_PATTERNS)) and p.dtype != torch.float32:
                 p.data = p.data.float()
 
-    compiled = torch.compile(base_model, dynamic=False, fullgraph=True)
+    compiled = torch.compile(base_model, dynamic=False)
     model = DDP(compiled, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled
 
     # EMA model
