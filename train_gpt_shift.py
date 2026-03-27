@@ -1,16 +1,3 @@
-"""
-train_gpt_shift.py  —  The Checkmate Pipeline (13-Layer INT4 + TTT + Muon + LaX)
-===================================================================================
-Target: 10-Minute 8x H100 Track | < 16MB | Goal: < 1.1150 val_bpb
-
-Synthesized SOTA Techniques:
-  1. Parameter Banking + Parallel Muon (Batched Newton-Schulz for sub-90ms steps)
-  2. LeakyReLU(0.5)² Activation (Zero dead neurons, -0.003 bpb)
-  3. Legal Score-First TTT (Inference-mode chunk scoring followed by 3-epoch SGD)
-  4. VE128 (Value Embeddings injected into the final 4 layers)
-  5. INT4 Bitwise Packing (Allows 13 layers to fit in ~12MB)
-  6. LaX (Latent Crossing - Cross-depth residual accumulation, +0.000ms overhead)
-"""
 
 from __future__ import annotations
 
