@@ -368,6 +368,50 @@ def execute_legal_ttt(args, base_model, rank, world_size, device, val_tokens):
     return (ls_total / tc_total).item()
 
 # ─────────────────────────────────────────────────────────────────────────────
+# DISTRIBUTED DATA LOADER
+# ─────────────────────────────────────────────────────────────────────────────
+def _load_shard(file: str) -> Tensor:
+    hb = 256 * 4
+    hdr = np.fromfile(file, dtype="<i4", count=256)
+    n = int(hdr[2])
+    return torch.from_numpy(np.fromfile(file, dtype="<u2", count=n, offset=hb).astype(np.int64))
+
+class TokenStream:
+    def __init__(self, pattern: str):
+        self.files = sorted(glob.glob(pattern))
+        self.fi, self.pos = 0, 0
+        self.tokens = _load_shard(self.files[0])
+        
+    def _adv(self):
+        self.fi = (self.fi + 1) % len(self.files)
+        self.tokens = _load_shard(self.files[self.fi])
+        self.pos = 0
+        
+    def take(self, n: int) -> Tensor:
+        chunks, rem = [], n
+        while rem > 0:
+            avail = self.tokens.numel() - self.pos
+            if avail <= 0:
+                self._adv(); continue
+            k = min(rem, avail)
+            chunks.append(self.tokens[self.pos : self.pos + k])
+            self.pos += k; rem -= k
+        return chunks[0] if len(chunks) == 1 else torch.cat(chunks)
+
+class DistributedTokenLoader:
+    def __init__(self, pattern, rank, world_size, device):
+        self.rank, self.world_size, self.device = rank, world_size, device
+        self.stream = TokenStream(pattern)
+        
+    def next_batch(self, global_tokens, seq_len):
+        lt = global_tokens // self.world_size
+        span = lt + 1
+        chunk = self.stream.take(span * self.world_size)
+        local = chunk[self.rank * span : self.rank * span + span]
+        x = local[:-1].reshape(-1, seq_len)
+        y = local[1:].reshape(-1, seq_len)
+        return x.to(self.device, non_blocking=True), y.to(self.device, non_blocking=True)
+# ─────────────────────────────────────────────────────────────────────────────
 # TRAINING EXECUTION
 # ─────────────────────────────────────────────────────────────────────────────
 def main():
@@ -397,13 +441,12 @@ def main():
     opt_scalar = torch.optim.AdamW(scalars, lr=args.scalar_lr, fused=True)
     opts = [opt_tok, opt_muon, opt_scalar]
 
-    stream = np.fromfile(glob.glob(args.train_files)[0], dtype="<u2", offset=1024).astype(np.int64)
-    stream = torch.from_numpy(stream)
+    
     
     t0 = time.perf_counter()
-    pos = 0
-    lbt = args.train_batch_tokens // world_size
-    lbs = lbt // args.train_seq_len
+    
+    # ADD THIS LINE:
+    train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
 
     for step in range(args.iterations):
         if time.perf_counter() - t0 > args.max_wallclock_seconds: 
@@ -414,9 +457,8 @@ def main():
         for o in opts:
             for g in o.param_groups: g["lr"] = g.get("base_lr", g["lr"]) * scale
 
-        local = stream[pos + rank * lbt : pos + (rank + 1) * lbt + 1].to(device)
-        pos += args.train_batch_tokens
-        x, y = local[:-1].reshape(lbs, args.train_seq_len), local[1:].reshape(lbs, args.train_seq_len)
+        # ADD THIS LINE:
+        x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len)
 
         with torch.autocast("cuda", torch.bfloat16): loss = ddp_model(x, y)
         loss.backward()
