@@ -107,6 +107,7 @@ class Hyperparameters:
 # ─────────────────────────────────────────────────────────────────────────────
 # PARALLEL MUON (Batched Newton-Schulz)
 # ─────────────────────────────────────────────────────────────────────────────
+@torch.compile
 def batched_newtonschulz5(G: Tensor, steps: int = 5, eps: float = 1e-7) -> Tensor:
     """Executes Newton-Schulz on 3D Parameter Banks in parallel. Massive speedup."""
     transpose = G.size(1) < G.size(2)
@@ -447,15 +448,17 @@ def main():
     val_tokens = load_val(args.val_files)
     
     model = GPT(args).to(device).bfloat16()
+    model = torch.compile(model)
     ddp_model = DDP(model, device_ids=[device.index])
     ema_model = copy.deepcopy(model).requires_grad_(False)
 
     banks = [p for n, p in model.named_parameters() if "bank" in n]
     scalars = [p for n, p in model.named_parameters() if "bank" not in n and "tok_emb" not in n]
     
-    opt_tok = torch.optim.AdamW(model.tok_emb.parameters(), lr=args.tied_embed_lr, fused=True)
+    # UPDATE THESE TWO LINES:
+    opt_tok = torch.optim.AdamW(model.tok_emb.parameters(), lr=args.tied_embed_lr, betas=(0.9, 0.95), fused=True)
     opt_muon = ParallelMuon(banks, lr=args.matrix_lr, momentum=args.mousse_momentum)
-    opt_scalar = torch.optim.AdamW(scalars, lr=args.scalar_lr, fused=True)
+    opt_scalar = torch.optim.AdamW(scalars, lr=args.scalar_lr, betas=(0.9, 0.95), fused=True)
     opts = [opt_tok, opt_muon, opt_scalar]
     for o in opts:
         for g in o.param_groups:
