@@ -725,11 +725,13 @@ def main():
     matrix_params = [p for n, p in block_params if p.ndim == 2 and not any(pat in n for pat in CONTROL_PATTERNS)]
     scalar_params = [p for n, p in block_params if p.ndim < 2 or any(pat in n for pat in CONTROL_PATTERNS)]
     if base_model.skip_weights.numel() > 0: scalar_params.append(base_model.skip_weights)
-    # Add bigram, smear, ve params to scalar
+    # Add bigram, smear, ve params to scalar (use id() to avoid tensor == shape mismatch)
+    assigned_ids = {id(p) for p in scalar_params} | {id(p) for p in matrix_params} | {id(base_model.tok_emb.weight)}
     for name, p in base_model.named_parameters():
         if any(x in name for x in ["bigram", "smear", "ve_"]):
-            if p not in scalar_params and p not in matrix_params:
+            if id(p) not in assigned_ids:
                 scalar_params.append(p)
+                assigned_ids.add(id(p))
 
     opt_tok = torch.optim.AdamW([{"params": [base_model.tok_emb.weight], "lr": args.tied_embed_lr, "base_lr": args.tied_embed_lr}],
                                  betas=(0.9, 0.95), weight_decay=args.adam_wd, fused=True)
