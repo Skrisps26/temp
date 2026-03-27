@@ -156,7 +156,7 @@ class ParallelMuon(torch.optim.Optimizer):
                     g_ortho = batched_newtonschulz5(X, steps=ns).squeeze(0)
                     g_ortho = g_ortho * max(1, g_ortho.size(0) / g_ortho.size(1)) ** 0.5
 
-                if is_dist: dist.all_reduce(g_ortho, op=dist.ReduceOp.SUM)
+                
                 
                 if wd > 0: p.mul_(1.0 - lr * wd)
                 p.add_(g_ortho.to(p.dtype), alpha=-lr)
@@ -326,6 +326,11 @@ def execute_legal_ttt(args, base_model, rank, world_size, device, val_tokens):
     chunk_size, stride, seq_len = args.ttt_chunk_tokens, 64, args.train_seq_len
     model = copy.deepcopy(base_model)
     model.requires_grad_(True)
+    
+    # 1. INITIALIZE ONCE OUTSIDE THE LOOP (Memory Safe)
+    ttt_ddp = DDP(model, device_ids=[device.index])
+    opt = torch.optim.SGD(ttt_ddp.parameters(), lr=args.ttt_lr, momentum=0.9)
+    
     ls_total, tc_total = torch.zeros((), device=device, dtype=torch.float64), torch.zeros((), device=device, dtype=torch.float64)
     total_len = val_tokens.numel() - 1
     chunk_starts = list(range(0, total_len, chunk_size))
@@ -334,7 +339,8 @@ def execute_legal_ttt(args, base_model, rank, world_size, device, val_tokens):
         end = min(start + chunk_size, total_len)
         chunk = val_tokens[start:end+1].to(device, dtype=torch.int64)
         
-        model.eval()
+        # 2. SCORE USING RAW MODEL (Bypasses DDP Hooks)
+        model.eval() 
         starts = list(range(0, chunk.numel() - seq_len, stride))
         my_starts = starts[rank::world_size]
         
@@ -353,9 +359,10 @@ def execute_legal_ttt(args, base_model, rank, world_size, device, val_tokens):
 
         if ci == len(chunk_starts) - 1: break 
         
-        model.train()
-        opt = torch.optim.SGD(model.parameters(), lr=args.ttt_lr, momentum=0.9)
+        # 3. TRAIN USING DDP MODEL (Synchronizes Gradients)
+        model.train() 
         seq_starts = list(range(0, chunk.numel() - seq_len, seq_len))
+        seq_starts = seq_starts[:(len(seq_starts) // world_size) * world_size]
         my_seqs = seq_starts[rank::world_size]
         
         for _ in range(args.ttt_epochs):
@@ -366,11 +373,11 @@ def execute_legal_ttt(args, base_model, rank, world_size, device, val_tokens):
                 ys = torch.stack([chunk[p+1 : p+seq_len+1] for p in batch])
                 
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True): 
-                    loss = model(xs, ys)
+                    loss = ttt_ddp(xs, ys)
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                torch.nn.utils.clip_grad_norm_(ttt_ddp.parameters(), 1.0)
                 opt.step()
-                opt.zero_grad()
+                opt.zero_grad(set_to_none=True)
                 
     if dist.is_available() and dist.is_initialized():
         dist.all_reduce(ls_total, op=dist.ReduceOp.SUM)
@@ -450,8 +457,9 @@ def main():
     opt_muon = ParallelMuon(banks, lr=args.matrix_lr, momentum=args.mousse_momentum)
     opt_scalar = torch.optim.AdamW(scalars, lr=args.scalar_lr, fused=True)
     opts = [opt_tok, opt_muon, opt_scalar]
-
-    
+    for o in opts:
+        for g in o.param_groups:
+            g["base_lr"] = g["lr"]
     
     t0 = time.perf_counter()
     
@@ -462,12 +470,8 @@ def main():
         if time.perf_counter() - t0 > args.max_wallclock_seconds: 
             log(f"Time limit reached at step {step}")
             break
-
-        frac = min(step / args.mousse_warmup_steps, 1.0) if args.mousse_warmup_steps > 0 else 1.0
-        cur_mom = (1 - frac) * args.mousse_warmup_start + frac * args.mousse_momentum
-        for g in opt_muon.param_groups: 
-            g["momentum"] = cur_mom
-        # ADD THESE LINES:
+            
+        # 1. Warmups & Schedules
         if step < args.warmup_steps:
             scale = (step + 1) / args.warmup_steps
         elif step > args.iterations - args.warmdown_iters:
@@ -475,27 +479,39 @@ def main():
             scale = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
         else:
             scale = 1.0
+
+        frac = min(step / args.mousse_warmup_steps, 1.0) if args.mousse_warmup_steps > 0 else 1.0
+        cur_mom = (1 - frac) * args.mousse_warmup_start + frac * args.mousse_momentum
+        
+        for g in opt_muon.param_groups: g["momentum"] = cur_mom
         for o in opts:
-            for g in o.param_groups: g["lr"] = g.get("base_lr", g["lr"]) * scale
+            for g in o.param_groups: g["lr"] = g["base_lr"] * scale
 
-        # ADD THIS LINE:
+        # 2. Forward / Backward
         x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len)
-
         with torch.autocast("cuda", torch.bfloat16): loss = ddp_model(x, y)
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         
+        # 3. Clip & Step
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         for o in opts: o.step()
         for o in opts: o.zero_grad(set_to_none=True)
 
+        # 4. EMA Update
         with torch.no_grad():
             for pe, pb in zip(ema_model.parameters(), model.parameters()):
                 pe.mul_(args.ema_decay).add_(pb, alpha=1.0 - args.ema_decay)
                 
-        if step > args.iterations * (1.0 - args.late_qat_frac):
-            with torch.no_grad():
-                for n, p in model.named_parameters():
-                    if "bank" in n: p.data = _fake_quant_int4(p.data)
+        # 5. Row-Aware Late QAT (3D Safe)
+        # if step > args.iterations * (1.0 - args.late_qat_frac):
+        #     with torch.no_grad():
+        #         for n, p in model.named_parameters():
+        #             if "bank" in n:
+        #                 orig_shape = p.shape
+        #                 w_flat = p.view(-1, p.shape[-1])
+        #                 s = w_flat.abs().amax(dim=-1, keepdim=True).clamp(min=1e-8) / 7.0
+        #                 q = torch.clamp(torch.round(w_flat / s), -8, 7)
+        #                 p.data = p.data + (q * s - w_flat).detach().view(orig_shape)
 
         if step % 100 == 0: 
             approx = 1000.0 * (time.perf_counter() - t0)
