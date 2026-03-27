@@ -80,7 +80,7 @@ class Hyperparameters:
     mlp_mult      = int(os.environ.get("MLP_MULT",      3))
     tie_embeddings= True
     rope_base     = float(os.environ.get("ROPE_BASE",   10000.0))
-    
+    shift_alpha_init = float(os.environ.get("SHIFT_ALPHA_INIT", 0.5))
     # Advanced Integrations
     xsa_layers    = int(os.environ.get("XSA_LAYERS",    4))
     ve_layers     = int(os.environ.get("VE_LAYERS",     4))
