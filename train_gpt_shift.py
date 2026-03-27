@@ -65,8 +65,10 @@ class Hyperparameters:
     seed           = int(os.environ.get("SEED", 1337))
 
     # Speedrun limits
-    iterations             = int(os.environ.get("ITERATIONS",          6800)) # 10 mins
-    warmdown_iters         = int(os.environ.get("WARMDOWN_ITERS",      2500))
+    # UPDATE THESE THREE LIMITS:
+    iterations             = int(os.environ.get("ITERATIONS",          4350)) # Fits the 10-minute wall
+    warmdown_iters         = int(os.environ.get("WARMDOWN_ITERS",      1200)) # Cools down for the last ~30%
+     # Reaches max momentum faster
     warmup_steps           = int(os.environ.get("WARMUP_STEPS",        150))
     train_batch_tokens     = int(os.environ.get("TRAIN_BATCH_TOKENS",  524288))
     train_seq_len          = int(os.environ.get("TRAIN_SEQ_LEN",       1024))
@@ -95,7 +97,7 @@ class Hyperparameters:
     scalar_lr             = float(os.environ.get("SCALAR_LR",             0.025))
     mousse_momentum       = float(os.environ.get("MOUSSE_MOMENTUM",       0.99))
     mousse_warmup_start   = float(os.environ.get("MOUSSE_WARMUP_START",   0.92))
-    mousse_warmup_steps   = int(os.environ.get("MOUSSE_WARMUP_STEPS",     1500))
+    mousse_warmup_steps    = int(os.environ.get("MOUSSE_WARMUP_STEPS", 1000))
     ema_decay             = float(os.environ.get("EMA_DECAY",             0.997))
     late_qat_frac         = float(os.environ.get("LATE_QAT_FRAC",         0.15))
 
@@ -325,9 +327,9 @@ class GPT(nn.Module):
 # ─────────────────────────────────────────────────────────────────────────────
 def execute_legal_ttt(args, base_model, rank, world_size, device, val_tokens):
     chunk_size, stride, seq_len = args.ttt_chunk_tokens, 64, args.train_seq_len
-    model = copy.deepcopy(base_model)
+    model = GPT(args).to(device).bfloat16()
+    model.load_state_dict(base_model.state_dict())
     model.requires_grad_(True)
-    
     # 1. INITIALIZE ONCE OUTSIDE THE LOOP (Memory Safe)
     ttt_ddp = DDP(model, device_ids=[device.index])
     opt = torch.optim.SGD(ttt_ddp.parameters(), lr=args.ttt_lr, momentum=0.9)
@@ -383,7 +385,7 @@ def execute_legal_ttt(args, base_model, rank, world_size, device, val_tokens):
     if dist.is_available() and dist.is_initialized():
         dist.all_reduce(ls_total, op=dist.ReduceOp.SUM)
         dist.all_reduce(tc_total, op=dist.ReduceOp.SUM)
-    return (ls_total / tc_total).item()
+    return (ls_total / tc_total).item() / math.log(2)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # DISTRIBUTED DATA LOADER
@@ -448,6 +450,9 @@ def main():
     val_tokens = load_val(args.val_files)
     
     model = GPT(args).to(device).bfloat16()
+    ema_model = GPT(args).to(device).bfloat16()
+    ema_model.load_state_dict(model.state_dict())
+    ema_model.requires_grad_(False)
     model = torch.compile(model)
     ddp_model = DDP(model, device_ids=[device.index])
     ema_model = copy.deepcopy(model).requires_grad_(False)
