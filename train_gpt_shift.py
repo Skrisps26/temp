@@ -116,7 +116,7 @@ class Hyperparameters:
     grad_clip_norm        = float(os.environ.get("GRAD_CLIP_NORM",        0.3))
 
     ema_decay             = float(os.environ.get("EMA_DECAY",             0.997))
-    late_qat_frac         = float(os.environ.get("LATE_QAT_FRAC",         0.15)) # 15% Deep QAT curriculum
+    late_qat_frac = float(os.environ.get("LATE_QAT_FRAC", 0.02)) # 15% Deep QAT curriculum
     sliding_window_stride = int(os.environ.get("SLIDING_WINDOW_STRIDE",   64))
 
 
@@ -731,7 +731,13 @@ def main():
         
         for o in optimizers: o.step()
         zero_grad()
-        update_ema(args.ema_decay)
+        
+        # Stop corrupting EMA once QAT starts
+        if not should_late_qat(step):
+            update_ema(args.ema_decay)
+
+        if should_late_qat(step):
+            base_model.apply_late_qat()
 
         if should_late_qat(step):
             base_model.apply_late_qat()
