@@ -550,9 +550,9 @@ def main():
         payload = pickle.dumps({"c": compress_bytes(buf.getvalue()), "m": meta})
         Path("final_model.ptz").write_bytes(payload)
         log(f"Artifact Size: {len(payload)/1e6:.2f} MB (Target < 16MB)")
-      if dist.is_available() and dist.is_initialized():
-          dist.barrier() # Forces Ranks 1-7 to wait here until Rank 0 finishes saving
-          dist.destroy_process_group()
+    if dist.is_available() and dist.is_initialized():
+        dist.barrier() # Forces Ranks 1-7 to wait here until Rank 0 finishes saving
+        dist.destroy_process_group()
 
 if __name__ == "__main__":
     main()
