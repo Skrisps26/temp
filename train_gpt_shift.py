@@ -165,9 +165,17 @@ class ParallelMuon(torch.optim.Optimizer):
 # INT4 BITWISE QUANTIZATION
 # ─────────────────────────────────────────────────────────────────────────────
 def _fake_quant_int4(w: Tensor) -> Tensor:
-    scale = w.abs().max().clamp(min=1e-8) / 7.0
+    orig_shape = w.shape
+    # Flatten 3D to 2D to calculate row-wise scales
+    if w.ndim == 3: w = w.view(-1, w.shape[-1])
+    
+    # Calculate scale per row (dim=-1)
+    scale = w.abs().amax(dim=-1, keepdim=True).clamp(min=1e-8) / 7.0
     q = torch.clamp(torch.round(w / scale), -8, 7)
-    return w + (q * scale - w).detach() 
+    dq = q * scale
+    
+    # Restore original 3D shape
+    return w + (dq - w).detach().view(orig_shape)
 
 def _quantize_tensor_int4_packed(t: Tensor):
     t32 = t.float()
@@ -240,6 +248,7 @@ class GPT(nn.Module):
 
         inv_freq = 1.0 / (args.rope_base ** (torch.arange(0, args.rope_dims, 2, dtype=torch.float32) / args.rope_dims))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
+        nn.init.normal_(self.tok_emb.weight, std=0.005)
 
     def forward(self, ids: Tensor, targets: Tensor = None) -> Tensor:
         B, T = ids.shape
@@ -453,8 +462,19 @@ def main():
         if time.perf_counter() - t0 > args.max_wallclock_seconds: 
             log(f"Time limit reached at step {step}")
             break
-            
-        scale = max((args.iterations - step) / args.warmdown_iters, 0.0) if step > args.iterations - args.warmdown_iters else 1.0
+
+        frac = min(step / args.mousse_warmup_steps, 1.0) if args.mousse_warmup_steps > 0 else 1.0
+        cur_mom = (1 - frac) * args.mousse_warmup_start + frac * args.mousse_momentum
+        for g in opt_muon.param_groups: 
+            g["momentum"] = cur_mom
+        # ADD THESE LINES:
+        if step < args.warmup_steps:
+            scale = (step + 1) / args.warmup_steps
+        elif step > args.iterations - args.warmdown_iters:
+            decay_ratio = (step - (args.iterations - args.warmdown_iters)) / args.warmdown_iters
+            scale = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
+        else:
+            scale = 1.0
         for o in opts:
             for g in o.param_groups: g["lr"] = g.get("base_lr", g["lr"]) * scale
 
@@ -463,6 +483,7 @@ def main():
 
         with torch.autocast("cuda", torch.bfloat16): loss = ddp_model(x, y)
         loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         
         for o in opts: o.step()
         for o in opts: o.zero_grad(set_to_none=True)
