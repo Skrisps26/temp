@@ -316,6 +316,7 @@ class GPT(nn.Module):
 def execute_legal_ttt(args, base_model, rank, world_size, device, val_tokens):
     chunk_size, stride, seq_len = args.ttt_chunk_tokens, 64, args.train_seq_len
     model = copy.deepcopy(base_model)
+    model.requires_grad_(True)
     ls_total, tc_total = torch.zeros((), device=device, dtype=torch.float64), torch.zeros((), device=device, dtype=torch.float64)
     total_len = val_tokens.numel() - 1
     chunk_starts = list(range(0, total_len, chunk_size))
